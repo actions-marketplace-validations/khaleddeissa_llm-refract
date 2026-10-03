@@ -2,7 +2,7 @@
 
 Refract bridges portable recordings to and from OpenTelemetry traces. Python and Node support
 OTLP/HTTP JSON conversion and explicit export. Python also imports completed OpenTelemetry SDK spans.
-The Refract API ingests canonical runs; it is not a native OTLP protobuf/gRPC collector.
+The service also receives native OTLP JSON/protobuf over HTTP and OTLP gRPC on its API port.
 
 ## Convert recordings offline
 
@@ -127,3 +127,71 @@ silently send your recordings to a cloud service.
 
 See [provider integrations](providers.md) for LangChain and local models, and
 [production operation](../production.md) for Refract service deployment and credential separation.
+
+## Native ingestion and distributed assembly
+
+Point an OTel exporter at `http://127.0.0.1:8000/v1/traces` for HTTP JSON (`application/json`) or
+protobuf (`application/x-protobuf`). OTLP gRPC uses the same port and the standard
+`opentelemetry.proto.collector.trace.v1.TraceService/Export` method. Supply `Authorization: Bearer KEY`
+as HTTP headers or gRPC metadata; a writer role is required. Use HTTPS ingress with HTTP/2 forwarding
+for production gRPC. Health and trace traffic use the same service deployment.
+
+```yaml
+# OpenTelemetry Collector exporter fragment; localhost is the collector's network namespace.
+exporters:
+  otlphttp/refract:
+    endpoint: http://127.0.0.1:8000
+    headers:
+      Authorization: "Bearer ${env:REFRACT_API_KEY}"
+```
+
+The server redacts before persistence and assembles spans by trace ID **within the authenticated scope**.
+Late parents produce a new immutable content-addressed snapshot containing the updated graph; they do
+not mutate earlier recordings. Identical retries reuse evidence; conflicting content for the same span
+ID and cyclic parentage are rejected. Missing parents remain explicit external references until seen.
+A request with multiple traces may persist earlier traces before a later invalid trace fails; retries
+are content-checked. Exporters should inspect failures and retry valid data.
+
+Limits: 16 MiB per request, 1,000 spans per trace batch, 10,000 spans/32 MiB per assembled trace and
+10,000 pending trace assemblies per scope. Assembly state expires after 24 hours during maintenance;
+recording snapshots follow normal run retention. Preserve upstream trace/span IDs for cross-process causality; a collector cannot recover spans
+that were never emitted. Local tests exercise actual protobuf/gRPC transport, auth, out-of-order spans,
+retry deduplication and cycle rollback. The offline SDK bridges remain stateless converters.
+
+## Logs and metrics
+
+The same authenticated port accepts all three OTLP signals. Send logs to `/v1/logs` and metrics to
+`/v1/metrics` with `application/json` or `application/x-protobuf`. Standard gRPC
+`LogsService/Export` and `MetricsService/Export` are available alongside `TraceService/Export`.
+Use a writer key for ingestion and a reader key for queries. Collector pipelines for traces, logs
+and metrics can share the `otlphttp/refract` exporter above.
+
+Resource, instrumentation-scope and data-point attributes are normalized before redaction. Logs retain
+severity, timestamps and trace/span IDs; metrics retain gauge, sum, histogram, exponential histogram
+or summary data, including temporality and exemplars. They are stored as telemetry records, separately
+from replayable `.rfr` executions. Refract preserves measurements; it does not calculate rates or
+aggregate metric windows automatically. Exact retries deduplicate by normalized content; identical
+records within one export retain their multiplicity. Repeated identical records across separate
+exports collapse, so supply real timestamps for distinct observations.
+
+```python
+from refract import RefractClient
+
+client = RefractClient("http://127.0.0.1:8000")
+page = client.telemetry(kind="logs", trace_id="0123456789abcdef0123456789abcdef")
+metrics = client.telemetry(kind="metrics", limit=50)
+```
+
+```typescript
+const page = await client.telemetry("logs", {
+  trace_id: "0123456789abcdef0123456789abcdef",
+});
+const metrics = await client.telemetry("metrics", { limit: 50 });
+```
+
+`GET /v1/telemetry?kind=logs&limit=50&offset=0` returns `records` and `next_offset`. Log queries can
+filter by trace ID. The Inspector's **OpenTelemetry logs and metrics** panel shows records and their
+attributes; MCP exposes `telemetry_records`. Telemetry uses tenant isolation, encryption/key rotation
+and the configured receipt-time retention period. Manual `/v1/admin/retention` also expires telemetry.
+Pages have at most 100 records/12 MiB; ingestion allows 10,000 records/16 MiB per export and 1 MiB per
+normalized record. Invalid batches roll back. See [runnable local examples](../../examples/otel/README.md).

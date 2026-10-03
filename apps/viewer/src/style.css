@@ -627,3 +627,62 @@ input {
   padding: 0.6rem;
   border-bottom: 1px solid var(--border, #263b36);
 }
+
+.embedding-controls {
+  padding: 0 18px 12px;
+  font-size: 12px;
+}
+.embedding-controls label {
+  display: block;
+  margin: 8px 0;
+}
+.embedding-controls select {
+  width: 100%;
+  margin-top: 5px;
+}
+.embedding-controls fieldset {
+  border: 1px solid #303945;
+  border-radius: 6px;
+  margin: 10px 0;
+}
+.embedding-controls input {
+  width: auto;
+  margin-right: 6px;
+}
+.embedding-controls button {
+  width: 100%;
+  margin: 5px 0;
+}
+.embedding-controls small {
+  display: block;
+  color: #a4b8b1;
+  margin-top: 5px;
+}
+
+.rerun-panel {
+  margin: 0 0 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border, #263c35);
+  border-radius: 10px;
+}
+.rerun-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.rerun-panel label {
+  display: block;
+  margin: 0.7rem 0;
+}
+.rerun-panel input {
+  margin-right: 0.5rem;
+}
+
+.telemetry-panel {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border: 1px solid var(--border, #263c35);
+  border-radius: 10px;
+}
+.telemetry-panel summary {
+  cursor: pointer;
+}

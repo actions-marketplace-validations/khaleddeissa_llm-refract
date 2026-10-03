@@ -126,11 +126,137 @@ test("API key enables authenticated search and is forgotten on reload", async ({
   });
   await page.goto("/");
   await expect(page.getByRole("alert")).toContainText("401");
-  await page.getByLabel("API key (tab memory only)").fill("test-viewer-key");
+  await page
+    .getByLabel("API key or access token (tab memory only)")
+    .fill("test-viewer-key");
   await page.getByRole("button", { name: "Use API key", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "customer-support" }),
   ).toBeVisible();
   await page.reload();
   await expect(page.getByRole("alert")).toContainText("401");
+});
+
+test("SSO restores a cookie session after reload and clears it on logout", async ({
+  page,
+  baseURL,
+}) => {
+  const redirect = new URL("/", baseURL!).toString();
+  let signedIn = false;
+  let exchanges = 0;
+  await page.route("**/v1/auth/config", (route) =>
+    route.fulfill({
+      json: {
+        enabled: true,
+        configuration: {
+          issuer: "https://identity.invalid",
+          client_id: "inspector",
+          redirect_uri: redirect,
+        },
+      },
+    }),
+  );
+  await page.route("**/v1/auth/start", (route) =>
+    route.fulfill({
+      json: {
+        url: "https://identity.invalid/authorize?state=server-bound-state",
+      },
+    }),
+  );
+  await page.route("https://identity.invalid/authorize?**", (route) => {
+    const callback = new URL(redirect);
+    callback.searchParams.set("code", "once");
+    callback.searchParams.set("state", "server-bound-state");
+    return route.fulfill({
+      status: 302,
+      headers: { location: callback.toString() },
+    });
+  });
+  await page.route("**/v1/auth/complete", async (route) => {
+    expect(route.request().postDataJSON()).toEqual({
+      code: "once",
+      state: "server-bound-state",
+    });
+    exchanges++;
+    signedIn = true;
+    await route.fulfill({ json: { authenticated: true } });
+  });
+  await page.route("**/v1/auth/me", (route) =>
+    route.fulfill({
+      status: signedIn ? 200 : 401,
+      json: signedIn ? { role: "reader" } : { error: "sign in" },
+    }),
+  );
+  await page.route("**/v1/auth/logout", (route) => {
+    signedIn = false;
+    return route.fulfill({ json: { authenticated: false } });
+  });
+  await page.route("**/v1/search?**", (route) => {
+    expect(route.request().headers().authorization).toBeUndefined();
+    return route.fulfill({
+      status: signedIn ? 200 : 401,
+      json: signedIn
+        ? { runs: [fixture], total: 1, limit: 100, offset: 0 }
+        : { error: "sign in" },
+    });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Sign in with SSO" }).click();
+  await expect(
+    page.getByRole("heading", { name: "customer-support" }),
+  ).toBeVisible();
+  expect(page.url()).toBe(redirect);
+  expect(
+    await page.evaluate(() =>
+      JSON.stringify({ ...localStorage, ...sessionStorage }),
+    ),
+  ).not.toContain("token");
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "customer-support" }),
+  ).toBeVisible();
+  expect(exchanges).toBe(1);
+  await page.getByRole("button", { name: "Sign out of SSO" }).click();
+  await expect(page.getByRole("alert")).toContainText("401");
+  await expect(
+    page.getByRole("button", { name: "Sign out of SSO" }),
+  ).toHaveCount(0);
+});
+
+test("late startup refresh preserves the run selected while authentication config loads", async ({
+  page,
+}) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/v1/auth/config", async (route) => {
+    await gate;
+    await route.fulfill({ json: { enabled: false } });
+  });
+  const first = { ...fixture, id: "refresh-first", name: "Refresh first" };
+  const second = {
+    ...fixture,
+    id: "refresh-selected",
+    name: "Refresh selected",
+  };
+  await page.route("**/v1/search?**", (route) =>
+    route.fulfill({ json: { runs: [first, second], total: 2 } }),
+  );
+  await page.goto("/");
+  await page
+    .getByLabel("API key or access token (tab memory only)")
+    .fill("fixture");
+  await page.getByRole("button", { name: "Use API key", exact: true }).click();
+  await page
+    .getByRole("button", { name: /Refresh selected.*refresh-selected/ })
+    .click();
+  const refreshed = page.waitForResponse((response) =>
+    response.url().includes("/v1/search?"),
+  );
+  release();
+  await refreshed;
+  await expect(
+    page.getByRole("heading", { name: "Refresh selected", exact: true }),
+  ).toBeVisible();
 });

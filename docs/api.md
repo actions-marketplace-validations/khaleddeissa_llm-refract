@@ -33,7 +33,7 @@ administrative routes within the same scope. `/v1/health` and `/v1/ready` are un
 Requests are limited to 16 MiB. Invalid application data returns 400, invalid keys 401, insufficient
 roles 403, absent/cross-scope runs 404, snapshot conflicts 409 and rate limits 429 with `Retry-After: 60`.
 Unknown body fields are rejected. Missing metric observations remain explicit; no pricing catalogue is
-used to invent costs. Similarity is a bounded, offline lexical ranking, not an embedding/vector search.
+used to invent costs. The similar-runs route uses lexical ranking; `/v1/search/vector` provides scoped cosine retrieval with exact and HNSW modes. `/v1/search/text` embeds a query using a configured project profile.
 
 ## HTTP examples
 
@@ -74,10 +74,66 @@ curl --fail -X POST "$REFRACT_URL/v1/eval" \
 
 A diff response contains `first_divergence`, `differences`, `metric_changes` and `semantic_report`
 (null unless requested). Evaluation returns `passed`, `total`, `regressions`, `equivalent` and named
-`results`. These endpoints use the built-in offline grader; custom/model graders and dataset manifests
-are supported by local [evaluation](usage/evaluation.md), not executed by the HTTP server.
+`results`. These endpoints use the offline grader by default. Set `grader` to a configured profile and
+`allow_live:true` to use its domain rubric and model. Dataset manifests are supported by local
+[evaluation](usage/evaluation.md).
 
 The export content type is `application/vnd.refract.rfr`. POST ingestion expects execution JSON,
-not the artifact header/body encoding: decode/validate the file first. There are no gRPC or OTLP
-receiver endpoints; use the SDK [OTLP JSON bridge](usage/otel.md) when integrating observability systems.
+not the artifact header/body encoding: decode/validate the file first. Native HTTP/protobuf and gRPC trace receivers are documented in [OpenTelemetry](usage/otel.md).
 [Production configuration](production.md) documents secrets, roles, TLS, databases and delivery.
+
+## Service extension routes
+
+| Method     | Path                          | Purpose                                          |
+| ---------- | ----------------------------- | ------------------------------------------------ |
+| GET        | `/v1/auth/config`             | Public browser SSO configuration; no credentials |
+| POST       | `/v1/traces`                  | OTLP HTTP JSON/protobuf ingestion; writer        |
+| PUT        | `/v1/runs/{id}/embedding`     | Store a model-namespaced vector; writer          |
+| POST       | `/v1/search/vector`           | Exact scoped cosine search; reader               |
+| GET / POST | `/v1/admin/keys`              | List key metadata / issue a scoped expiring key  |
+| DELETE     | `/v1/admin/keys/{id}`         | Revoke a managed key                             |
+| PUT        | `/v1/admin/principals`        | Provision or disable an OIDC subject             |
+| GET        | `/v1/admin/audit/export`      | Bounded NDJSON export page                       |
+| POST       | `/v1/admin/audit/expire`      | Expire audit history by age                      |
+| POST       | `/v1/admin/encryption/rotate` | Re-encrypt a bounded batch per payload table     |
+
+All `/v1/admin` routes require admin role in the current scope. See [service controls](usage/service-controls.md)
+for request bodies, limits and operating procedures. Native gRPC uses the standard TraceService Export
+route on the same port. It does not accept execution `.rfr` files.
+
+## Project embeddings and text search
+
+| Method | Path                           | Purpose                                                                            |
+| ------ | ------------------------------ | ---------------------------------------------------------------------------------- |
+| GET    | `/v1/auth/me`                  | Current authenticated identity, role, and scope                                    |
+| GET    | `/v1/embedding-models`         | Operator-approved model profiles available to this scope; no credentials/endpoints |
+| GET    | `/v1/project/embeddings`       | Enabled project profiles and indexing job counts                                   |
+| PUT    | `/v1/admin/project/embeddings` | Admin replaces selections with an array of `{profile,is_default,auto_index}`       |
+| POST   | `/v1/admin/embeddings/reindex` | Admin queues/retries indexing of recorded runs                                     |
+| POST   | `/v1/search/text`              | Reader submits `{query,profile?,limit?,mode?}`; returns runs and scored matches    |
+
+Text and vector search accept `mode: "auto"` (default), `"exact"`, or `"approximate"`.
+Read the [search guide](usage/search.md) for provider profiles, preprocessing, namespaces,
+worker recovery, cache sizing, and SDK examples. Text search may call the selected provider; vector
+search only uses submitted/stored vectors.
+
+## Generation models and executable branches
+
+- `GET /v1/generation-models`: scoped, public profile metadata; no endpoints/credentials.
+- `POST /v1/runs/{id}/rerun`: writer creates a stored model branch with
+  `{profile,from_event,allow_live,approved_events:[],reuse_recorded:[]}`.
+- `POST /v1/diff` and `/v1/eval`: optional `grader` profile and `allow_live:true` enable configured
+  domain grading. Failures produce failing reports, never implied equivalence.
+
+See [model execution](usage/rerun.md) for profiles, consent, provider protocols and timeout/size budgets.
+
+## Telemetry and identity lifecycle
+
+- `POST /v1/logs`, `POST /v1/metrics`: OTLP JSON/protobuf, writer role; equivalent native gRPC services share the API port.
+- `GET /v1/telemetry`: reader query with `kind`, optional log `trace_id`, `limit`, `offset`.
+- `POST /v1/auth/start`, `/v1/auth/complete`, `/v1/auth/logout`: same-origin browser session lifecycle.
+- `/scim/v2/Users`, `/scim/v2/Groups`: scoped admin SCIM collections; `GET`/`POST` on collections and `GET`/`PUT`/`PATCH`/`DELETE` on IDs.
+- `GET /scim/v2/ServiceProviderConfig`: scoped admin discovery of supported SCIM operations.
+
+See [telemetry](usage/otel.md#logs-and-metrics) and [identity configuration](usage/service-controls.md#browser-sso)
+for payloads, session expiry, group mappings, encryption and production configuration.

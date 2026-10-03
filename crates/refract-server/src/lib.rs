@@ -1,5 +1,15 @@
+mod browser;
+mod controls;
 mod delivery;
+mod embeddings;
+mod generation;
+mod identity_api;
+pub mod login;
+pub mod oidc;
+mod otel;
+mod scim;
 pub mod security;
+mod telemetry;
 
 use axum::{
     Extension, Json, Router,
@@ -15,11 +25,7 @@ use refract_storage::{Encryption, RunFilter, SnapshotConflict, Store, StoreOptio
 use security::{Role, Security};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{collections::BTreeSet, time::Instant};
 use tower_http::services::ServeDir;
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -51,7 +57,8 @@ struct AppState {
     store: Store,
     security: Security,
     redaction: refract_collector::RedactionPolicy,
-    requests: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
+    embeddings: embeddings::Registry,
+    generation: generation::Registry,
 }
 /// Development router with a local admin identity. Use router_with_security for shared services.
 pub fn router(store: Store) -> Router {
@@ -62,25 +69,84 @@ pub fn router_with_security(store: Store, security: Security) -> Router {
         store,
         security,
         refract_collector::RedactionPolicy::default(),
+        embeddings::Registry::default(),
+        generation::Registry::default(),
     )
 }
 fn router_with_policy(
     store: Store,
     security: Security,
     redaction: refract_collector::RedactionPolicy,
+    embeddings: embeddings::Registry,
+    generation: generation::Registry,
 ) -> Router {
     let state = AppState {
         store,
         security,
         redaction,
-        requests: Arc::default(),
+        embeddings,
+        generation,
     };
     Router::new()
         .route("/v1/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/v1/ready", get(ready))
+        .route("/v1/auth/config", get(login::config))
+        .route("/v1/auth/start", post(browser::start))
+        .route("/v1/auth/complete", post(browser::complete))
+        .route("/v1/auth/logout", post(browser::logout))
+        .route("/scim/v2/ServiceProviderConfig", get(scim::configuration))
+        .route("/scim/v2/{kind}", get(scim::list).post(scim::create))
+        .route(
+            "/scim/v2/{kind}/{id}",
+            get(scim::get)
+                .put(scim::replace)
+                .patch(scim::patch)
+                .delete(scim::delete),
+        )
+        .route(
+            "/v1/auth/me",
+            get(
+                |Extension(identity): Extension<security::Identity>| async move {
+                    Json(json!({"id":identity.id,"role":identity.role,"scope":identity.scope}))
+                },
+            ),
+        )
         .route("/v1/runs", get(list).post(create))
+        .route("/v1/traces", post(otel::http))
+        .route("/v1/logs", post(telemetry::logs_http))
+        .route("/v1/metrics", post(telemetry::metrics_http))
+        .route("/v1/telemetry", get(telemetry::list))
+        .route_service(
+            "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+            telemetry::logs_grpc(),
+        )
+        .route_service(
+            "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+            telemetry::metrics_grpc(),
+        )
+        .route_service(
+            "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+            otel::grpc(),
+        )
         .route("/v1/runs/batch", post(batch))
         .route("/v1/search", get(search))
+        .route("/v1/search/vector", post(controls::vector_search))
+        .route("/v1/search/text", post(embeddings::search))
+        .route("/v1/generation-models", get(generation::models))
+        .route("/v1/runs/{id}/rerun", post(generation::rerun))
+        .route("/v1/embedding-models", get(embeddings::models))
+        .route("/v1/project/embeddings", get(embeddings::settings))
+        .route(
+            "/v1/admin/project/embeddings",
+            axum::routing::put(embeddings::configure),
+        )
+        .route("/v1/admin/embeddings/reindex", post(embeddings::reindex))
+        .route(
+            "/v1/runs/{id}/embedding",
+            axum::routing::put(controls::embedding),
+        )
+        .route("/v1/admin/audit/export", get(controls::audit_export))
+        .route("/v1/admin/audit/expire", post(controls::audit_expire))
         .route("/v1/runs/{id}", get(inspect))
         .route("/v1/runs/{id}/events", get(events))
         .route("/v1/runs/{id}/metrics", get(metrics))
@@ -91,15 +157,36 @@ fn router_with_policy(
         .route("/v1/diff", post(diff))
         .route("/v1/eval", post(evaluate))
         .route("/v1/admin/audit", get(audit_log))
+        .route(
+            "/v1/admin/keys",
+            get(identity_api::keys).post(identity_api::create_key),
+        )
+        .route(
+            "/v1/admin/keys/{id}",
+            axum::routing::delete(identity_api::revoke_key),
+        )
+        .route(
+            "/v1/admin/principals",
+            axum::routing::put(identity_api::provision),
+        )
         .route("/v1/admin/retention", post(retention))
         .route("/v1/admin/outbox", get(outbox))
+        .route("/v1/admin/encryption/rotate", post(controls::rotate))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state)
 }
 async fn authorize(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();
-    if matches!(path.as_str(), "/v1/health" | "/v1/ready") {
+    if matches!(
+        path.as_str(),
+        "/v1/health"
+            | "/v1/ready"
+            | "/v1/auth/config"
+            | "/v1/auth/start"
+            | "/v1/auth/complete"
+            | "/v1/auth/logout"
+    ) {
         return next.run(request).await;
     }
     let bearer = request
@@ -107,33 +194,53 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "));
-    let Some(identity) = state.security.authenticate(bearer) else {
+    let identity_result = if bearer.is_none()
+        && browser::cookie(request.headers(), "__Host-refract.session").is_some()
+    {
+        if !matches!(*request.method(), Method::GET | Method::HEAD)
+            && let Err(error) = browser::origin(&state, request.headers())
+        {
+            return error.into_response();
+        }
+        browser::authenticate(&state, request.headers()).await
+    } else {
+        state
+            .security
+            .authenticate_store(&state.store, bearer)
+            .await
+    };
+    let identity = match identity_result {
+        Ok(identity) => identity,
+        Err(error) => return internal(error).into_response(),
+    };
+    let Some(identity) = identity else {
+        // Do not persist supplied tokens, query strings or arbitrary headers.
+        eprintln!("authentication failed");
         return ApiError(
             StatusCode::UNAUTHORIZED,
             "valid Bearer API key required".into(),
         )
         .into_response();
     };
-    let store = state.store.scoped(identity.scope);
+    request.extensions_mut().insert(identity.clone());
+    let store = state.store.scoped(identity.scope.clone());
     let method = request.method().clone();
     let readonly = method == Method::GET
         || method == Method::HEAD
+        || path == "/v1/search/vector"
+        || path == "/v1/search/text"
         || path == "/v1/diff"
         || path == "/v1/eval"
         || path.ends_with("/replay");
-    let forbidden = path.starts_with("/v1/admin/") && identity.role != Role::Admin
+    let forbidden = (path.starts_with("/v1/admin/") || path.starts_with("/scim/"))
+        && identity.role != Role::Admin
         || !readonly && identity.role == Role::Reader;
-    let limited = {
-        let mut requests = state.requests.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, count) = requests
-            .entry(identity.id.clone())
-            .or_insert((Instant::now(), 0));
-        if start.elapsed().as_secs() >= 60 {
-            *start = Instant::now();
-            *count = 0;
-        }
-        *count = count.saturating_add(1);
-        *count > state.security.requests_per_minute
+    let limited = match store
+        .allow_request(&identity.id, state.security.requests_per_minute)
+        .await
+    {
+        Ok(allowed) => !allowed,
+        Err(error) => return internal(error).into_response(),
     };
     request.extensions_mut().insert(store.clone());
     request.extensions_mut().insert(state.redaction.clone());
@@ -312,7 +419,7 @@ async fn replay(
 ) -> ApiResult<Json<Value>> {
     if req.mode != "exact" {
         return Err(invalid(
-            "only exact recorded playback is supported by this endpoint; use local rerun handlers for executable replay",
+            "only exact recorded playback is supported by this endpoint; use /v1/runs/{id}/rerun or a local executor for executable replay",
         ));
     }
     Ok(Json(
@@ -353,8 +460,13 @@ struct DiffRequest {
     semantic: bool,
     #[serde(default)]
     options: SemanticOptions,
+    #[serde(default)]
+    grader: Option<String>,
+    #[serde(default)]
+    allow_live: bool,
 }
 async fn diff(
+    State(state): State<AppState>,
     Extension(s): Extension<Store>,
     Json(req): Json<DiffRequest>,
 ) -> ApiResult<Json<Value>> {
@@ -362,8 +474,25 @@ async fn diff(
     let left = load(&s, &req.left).await?;
     let right = load(&s, &req.right).await?;
     let differences = refract_diff::compare(&left, &right);
+    let semantic_report = if req.semantic {
+        Some(
+            state
+                .generation
+                .compare(
+                    s.scope(),
+                    &left,
+                    &right,
+                    &req.options,
+                    req.grader.as_deref(),
+                    req.allow_live,
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
     Ok(Json(
-        json!({"first_divergence":differences.first().map(|d|d.index),"differences":differences,"metric_changes":refract_core::compare_metrics(&left,&right),"semantic_report":req.semantic.then(||compare_semantic(&left,&right,&req.options))}),
+        json!({"first_divergence":differences.first().map(|d|d.index),"differences":differences,"metric_changes":refract_core::compare_metrics(&left,&right),"semantic_report":semantic_report}),
     ))
 }
 #[derive(Deserialize)]
@@ -379,8 +508,13 @@ struct EvalRequest {
     pairs: Vec<EvalPair>,
     #[serde(default)]
     options: SemanticOptions,
+    #[serde(default)]
+    grader: Option<String>,
+    #[serde(default)]
+    allow_live: bool,
 }
 async fn evaluate(
+    State(state): State<AppState>,
     Extension(s): Extension<Store>,
     Json(req): Json<EvalRequest>,
 ) -> ApiResult<Json<Value>> {
@@ -388,17 +522,40 @@ async fn evaluate(
     if req.pairs.is_empty() || req.pairs.len() > 100 {
         return Err(invalid("evaluation requires 1..100 pairs"));
     }
-    let mut results = vec![];
-    let mut passed = 0;
-    for pair in req.pairs {
-        let report = compare_semantic(
-            &load(&s, &pair.left).await?,
-            &load(&s, &pair.right).await?,
-            &req.options,
-        );
-        passed += usize::from(report.passed);
-        results.push(json!({"name":pair.name,"left":pair.left,"right":pair.right,"report":report}));
+    // Validate every referenced recording before the first external grading call.
+    for pair in &req.pairs {
+        load(&s, &pair.left).await?;
+        load(&s, &pair.right).await?;
     }
+    let (results, passed) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let mut results = vec![];
+        let mut passed = 0;
+        for pair in req.pairs {
+            let report = state
+                .generation
+                .compare(
+                    s.scope(),
+                    &load(&s, &pair.left).await?,
+                    &load(&s, &pair.right).await?,
+                    &req.options,
+                    req.grader.as_deref(),
+                    req.allow_live,
+                )
+                .await?;
+            passed += usize::from(report.passed);
+            results.push(
+                json!({"name":pair.name,"left":pair.left,"right":pair.right,"report":report}),
+            );
+        }
+        Ok::<_, ApiError>((results, passed))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::GATEWAY_TIMEOUT,
+            "evaluation exceeded 120 seconds".into(),
+        )
+    })??;
     Ok(Json(
         json!({"passed":passed==results.len(),"total":results.len(),"regressions":results.len()-passed,"equivalent":passed,"results":results}),
     ))
@@ -430,7 +587,7 @@ async fn retention(
     }
     let before = chrono::Utc::now() - chrono::Duration::days(i64::from(req.days));
     Ok(Json(
-        json!({"deleted":s.retain_since(before).await.map_err(internal)?,"before":before}),
+        json!({"deleted":s.retain_since(before).await.map_err(internal)?,"telemetry_deleted":s.expire_telemetry(before).await.map_err(internal)?,"before":before}),
     ))
 }
 async fn outbox(Extension(s): Extension<Store>) -> ApiResult<Json<Value>> {
@@ -443,10 +600,20 @@ pub async fn serve() -> anyhow::Result<()> {
     let address = std::env::var("REFRACT_BIND").unwrap_or("127.0.0.1:8000".into());
     let security = Security::from_env()?;
     let delivery = delivery::Delivery::from_env()?;
-    let encryption = security::secret("REFRACT_ENCRYPTION_KEY")?
-        .map(|key| Encryption::from_base64(&key))
-        .transpose()?;
+    let single_key = security::secret("REFRACT_ENCRYPTION_KEY")?;
+    let keyring = security::secret("REFRACT_ENCRYPTION_KEYS")?;
+    anyhow::ensure!(
+        single_key.is_none() || keyring.is_none(),
+        "configure either a single encryption key or a keyring"
+    );
+    let encryption = match (single_key, keyring) {
+        (Some(key), _) => Some(Encryption::from_base64(&key)?),
+        (_, Some(ring)) => Some(Encryption::from_keyring_json(&ring)?),
+        _ => None,
+    };
     let mode = std::env::var("REFRACT_MODE").unwrap_or("local".into());
+    let embeddings = embeddings::Registry::from_env(mode == "production")?;
+    let generation = generation::Registry::from_env(mode == "production")?;
     security::validate_mode(
         &mode,
         &security,
@@ -462,12 +629,60 @@ pub async fn serve() -> anyhow::Result<()> {
         },
     )
     .await?;
+    anyhow::ensure!(
+        security.login.is_none() || store.has_encryption(),
+        "browser SSO requires storage encryption"
+    );
+    let rotation = std::env::var("REFRACT_ENCRYPTION_ROTATE_BATCH")
+        .ok()
+        .map(|v| v.parse::<i64>())
+        .transpose()?;
+    anyhow::ensure!(
+        rotation.is_none_or(|v| (1..=1000).contains(&v)),
+        "rotation batch must be 1..1000"
+    );
+    let runtime_url = security::secret("REFRACT_RUNTIME_DATABASE_URL")?;
+    let runtime_store = match runtime_url {
+        Some(url) => store.runtime_pool(&url).await?,
+        None => store.clone(),
+    };
     let worker_store = store.clone();
+    let embedding_store = store.clone();
+    let embedding_registry = embeddings.clone();
+    let embedding_worker = tokio::spawn(async move {
+        let mut repair = Instant::now();
+        loop {
+            if repair.elapsed().as_secs() >= 60 {
+                if let Ok(scopes) = embedding_store.scopes().await {
+                    for scope in scopes {
+                        if embedding_store
+                            .scoped(scope)
+                            .reindex_embeddings(false)
+                            .await
+                            .is_err()
+                        {
+                            eprintln!("embedding scheduling repair failed");
+                        }
+                    }
+                }
+                repair = Instant::now();
+            }
+            match embedding_registry.process_one(&embedding_store).await {
+                Ok(true) => continue,
+                Ok(false) => (),
+                Err(_) => eprintln!("embedding worker failed; inspect database health"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
     let retention = security.retention;
     let worker = tokio::spawn(async move {
         let mut last_retention = Instant::now() - std::time::Duration::from_secs(3600);
         loop {
             if last_retention.elapsed().as_secs() >= 3600 {
+                if worker_store.expire_rate_buckets().await.is_err() {
+                    eprintln!("rate bucket cleanup failed");
+                }
                 if let Some(age) = retention {
                     let before = chrono::Utc::now()
                         - chrono::Duration::from_std(age).expect("validated retention");
@@ -475,6 +690,9 @@ pub async fn serve() -> anyhow::Result<()> {
                         Ok(scopes) => {
                             for scope in scopes {
                                 let scoped = worker_store.scoped(scope);
+                                if scoped.expire_telemetry(before).await.is_err() {
+                                    eprintln!("telemetry retention failed");
+                                }
                                 match scoped.retain_since(before).await {
                                     Ok(deleted) if deleted > 0 => {
                                         let _ = scoped
@@ -493,7 +711,33 @@ pub async fn serve() -> anyhow::Result<()> {
                         }
                     }
                 }
+                if worker_store
+                    .expire_traces(chrono::Utc::now().timestamp() - 86400)
+                    .await
+                    .is_err()
+                {
+                    eprintln!("trace assembly expiry failed");
+                }
                 last_retention = Instant::now();
+            }
+            if let Some(limit) = rotation {
+                match worker_store.scopes().await {
+                    Ok(scopes) => {
+                        for scope in scopes {
+                            if worker_store
+                                .scoped(scope)
+                                .rotate_encryption(limit)
+                                .await
+                                .is_err()
+                            {
+                                eprintln!(
+                                    "encryption rotation failed; retain old keys and inspect database health"
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => eprintln!("encryption rotation scope enumeration failed"),
+                }
             }
             match delivery.process_one(&worker_store).await {
                 Ok(true) => continue,
@@ -508,9 +752,11 @@ pub async fn serve() -> anyhow::Result<()> {
     }
     let ui = std::env::var("REFRACT_UI_DIR").unwrap_or("apps/viewer/dist".into());
     let app = router_with_policy(
-        store,
+        runtime_store,
         security,
         refract_collector::RedactionPolicy::from_env()?,
+        embeddings,
+        generation,
     )
     .fallback_service(ServeDir::new(ui));
     let listener = tokio::net::TcpListener::bind(&address).await?;
@@ -519,6 +765,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await;
     worker.abort();
+    embedding_worker.abort();
     result?;
     Ok(())
 }
