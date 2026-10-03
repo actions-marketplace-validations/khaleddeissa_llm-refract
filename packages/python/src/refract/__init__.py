@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from .artifact import pack
+from .client import RefractClient as RefractClient
 
 SPEC_VERSION = "refract.execution.v1"
 _current: contextvars.ContextVar[Run | None] = contextvars.ContextVar("refract_run", default=None)
@@ -28,6 +29,24 @@ _METRICS = {
     "cache_read_tokens",
     "cache_write_tokens",
     "total_tokens",
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "maxTokens",
+    "maxOutputTokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "inputTokens",
+    "outputTokens",
+    "totalTokens",
+    "prompt_token_count",
+    "candidates_token_count",
+    "thoughts_token_count",
+    "cached_content_token_count",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cacheReadInputTokens",
+    "cacheWriteInputTokens",
 }
 _TYPES = {
     "generation",
@@ -334,3 +353,42 @@ def trace(fn=None, *, name: str | None = None):
         return synchronous
 
     return decorate(fn) if fn else decorate
+
+
+def instrument_bedrock_native(client, **kwargs):
+    """Observe native Bedrock InvokeModel APIs without draining response bodies."""
+    from .integrations.adapters import instrument_bedrock_native as install
+
+    return install(client, **kwargs)
+
+
+def instrument_vertex(model, **kwargs):
+    """Observe an existing vertexai GenerativeModel instance."""
+    from .integrations.adapters import instrument_vertex as install
+
+    return install(model, **kwargs)
+
+
+def instrument_library(client, library: str, **kwargs):
+    """Observe Ollama, Hugging Face, llama.cpp or LiteLLM clients."""
+    from .integrations.adapters import instrument_library as install
+
+    return install(client, library, **kwargs)
+
+
+def instrument_litellm(client=None, **kwargs):
+    """Observe LiteLLM module or Router generation methods without duplicate provider events."""
+    if client is None:
+        try:
+            import litellm
+        except ImportError as error:
+            raise ImportError("Install llm-refract[litellm] to instrument LiteLLM") from error
+        client = litellm
+    return instrument_library(client, "litellm", **kwargs)
+
+
+def instrument_realtime(connection, **kwargs):
+    """Observe an existing Realtime connection without retaining binary audio."""
+    from .integrations.realtime import instrument_realtime as install
+
+    return install(connection, **kwargs)

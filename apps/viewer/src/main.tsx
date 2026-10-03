@@ -1,11 +1,21 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type {
   Execution,
   ExecutionEvent,
 } from "../../../packages/typescript/src/index.js";
 import { request, setApiKey, download } from "./api";
+import {
+  beginLogin,
+  completeLogin,
+  logout,
+  type LoginConfiguration,
+} from "./login";
 import { ExecutionGraph } from "./graph";
+import { TelemetryPanel } from "./telemetry";
+import { RerunControls } from "./generation";
+import type { GenerationModel } from "../../../packages/typescript/src/client.js";
+import { EmbeddingControls } from "./embeddings";
 import { metrics, number, difference } from "./metrics";
 import "./style.css";
 interface SemanticReport {
@@ -23,19 +33,46 @@ interface SemanticReport {
 function App() {
   const [runs, setRuns] = useState<Execution[]>([]);
   const [run, setRun] = useState<Execution>();
+  const selectedRunId = useRef<string | undefined>(undefined);
+  const refreshSequence = useRef(0);
   const [selected, setSelected] = useState<ExecutionEvent>();
   const [error, setError] = useState("");
   const [result, setResult] = useState<unknown>();
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [embeddingProfile, setEmbeddingProfile] = useState("");
+  const [authRevision, setAuthRevision] = useState(0);
+  const [ssoSession, setSsoSession] = useState(false);
   const [compareId, setCompareId] = useState("");
   const [semantic, setSemantic] = useState(true);
+  const [generationModels, setGenerationModels] = useState<GenerationModel[]>(
+    [],
+  );
+  const [grader, setGrader] = useState("");
+  const [allowGrading, setAllowGrading] = useState(false);
+  useEffect(() => {
+    let active = true;
+    setGenerationModels([]);
+    setGrader("");
+    setAllowGrading(false);
+    void request<{ models: GenerationModel[] }>("/v1/generation-models")
+      .then((data) => {
+        if (active) setGenerationModels(data.models);
+      })
+      .catch(() => {
+        /* Authenticated discovery retries when credentials change. */
+      });
+    return () => {
+      active = false;
+    };
+  }, [authRevision]);
   const semanticResult =
     result && typeof result === "object" && "semantic_report" in result
       ? (result.semantic_report as SemanticReport | undefined)
       : undefined;
   const [credential, setCredential] = useState("");
   const [authenticated, setAuthenticated] = useState(false);
+  const [login, setLogin] = useState<LoginConfiguration>();
   const [filters, setFilters] = useState({
     q: "",
     status: "",
@@ -49,41 +86,86 @@ function App() {
   const compare = runs.find((item) => item.id === compareId);
   const candidate = compare ? metrics(compare) : undefined;
   const choose = (r: Execution) => {
+    selectedRunId.current = r.id;
     setRun(r);
     setSelected(r.events[0]);
     setResult(undefined);
     setCompareId("");
   };
   async function refresh(page = 0) {
+    const sequence = ++refreshSequence.current;
     setError("");
     setLoading(true);
     try {
       const query = new URLSearchParams({ limit: "100", offset: String(page) });
       for (const [key, value] of Object.entries(filters))
         if (value.trim()) query.set(key, value.trim());
-      const loaded = await request<{ runs: Execution[]; total: number }>(
-        `/v1/search?${query}`,
-      );
+      const loaded = embeddingProfile
+        ? await request<{ runs: Execution[]; total: number }>(
+            "/v1/search/text",
+            {
+              query: filters.q,
+              profile: embeddingProfile,
+              limit: 100,
+            },
+          )
+        : await request<{ runs: Execution[]; total: number }>(
+            `/v1/search?${query}`,
+          );
+      if (sequence !== refreshSequence.current) return;
       setRuns(loaded.runs);
       setOffset(page);
       setTotal(loaded.total);
       if (
         loaded.runs.length &&
-        !loaded.runs.some((item) => item.id === run?.id)
+        !loaded.runs.some((item) => item.id === selectedRunId.current)
       )
         choose(loaded.runs[0]);
       if (!loaded.runs.length) {
+        selectedRunId.current = undefined;
         setRun(undefined);
         setSelected(undefined);
       }
     } catch (e) {
-      setError(String(e));
+      if (sequence === refreshSequence.current) setError(String(e));
     } finally {
-      setLoading(false);
+      if (sequence === refreshSequence.current) setLoading(false);
     }
   }
   useEffect(() => {
-    void refresh();
+    void (async () => {
+      try {
+        const response = await fetch("/v1/auth/config");
+        if (response.ok) {
+          const auth = (await response.json()) as {
+            enabled: boolean;
+            configuration?: LoginConfiguration;
+          };
+          if (auth.enabled && auth.configuration) {
+            setLogin(auth.configuration);
+            const callback = new URL(window.location.href);
+            if (
+              callback.searchParams.has("code") ||
+              callback.searchParams.has("error")
+            ) {
+              // Remove authorization codes from browser history before any asynchronous exchange.
+              window.history.replaceState(null, "", window.location.pathname);
+              if (await completeLogin(auth.configuration, callback)) {
+                setSsoSession(true);
+                setAuthRevision((value) => value + 1);
+              }
+            }
+            const session = await fetch("/v1/auth/me");
+            setSsoSession(session.ok);
+            if (session.ok) setAuthRevision((value) => value + 1);
+          }
+        }
+        await refresh();
+      } catch (failure) {
+        setError(String(failure));
+        setLoading(false);
+      }
+    })();
   }, []);
   async function action(kind: "replay" | "fork" | "diff") {
     if (!run) return;
@@ -104,6 +186,7 @@ function App() {
             left: run.id,
             right: compareId,
             semantic,
+            ...(semantic && grader ? { grader, allow_live: allowGrading } : {}),
           }),
         );
       else
@@ -147,47 +230,55 @@ function App() {
               setFilters({ ...filters, q: event.target.value })
             }
           />
-          <details>
-            <summary>Filter executions</summary>
-            <label>
-              Status
-              <select
-                aria-label="Filter status"
-                value={filters.status}
-                onChange={(event) =>
-                  setFilters({ ...filters, status: event.target.value })
-                }
-              >
-                <option value="">Any status</option>
-                <option>completed</option>
-                <option>failed</option>
-                <option>running</option>
-              </select>
-            </label>
-            {(
-              [
-                ["model", "Model"],
-                ["tool", "Tool name"],
-                ["min_duration_ms", "Minimum latency (ms)"],
-              ] as const
-            ).map(([key, label]) => (
-              <label key={key}>
-                {label}
-                <input
-                  value={filters[key]}
-                  type={key === "min_duration_ms" ? "number" : "text"}
-                  min="0"
+          {!embeddingProfile && (
+            <details>
+              <summary>Filter executions</summary>
+              <label>
+                Status
+                <select
+                  aria-label="Filter status"
+                  value={filters.status}
                   onChange={(event) =>
-                    setFilters({ ...filters, [key]: event.target.value })
+                    setFilters({ ...filters, status: event.target.value })
                   }
-                />
+                >
+                  <option value="">Any status</option>
+                  <option>completed</option>
+                  <option>failed</option>
+                  <option>running</option>
+                </select>
               </label>
-            ))}
-          </details>
+              {(
+                [
+                  ["model", "Model"],
+                  ["tool", "Tool name"],
+                  ["min_duration_ms", "Minimum latency (ms)"],
+                ] as const
+              ).map(([key, label]) => (
+                <label key={key}>
+                  {label}
+                  <input
+                    value={filters[key]}
+                    type={key === "min_duration_ms" ? "number" : "text"}
+                    min="0"
+                    onChange={(event) =>
+                      setFilters({ ...filters, [key]: event.target.value })
+                    }
+                  />
+                </label>
+              ))}
+            </details>
+          )}
           <button type="submit" disabled={loading}>
             Search
           </button>
         </form>
+        <EmbeddingControls
+          key={authRevision}
+          profile={embeddingProfile}
+          onChange={setEmbeddingProfile}
+          refreshToken={authRevision}
+        />
         <p className="muted result-count">{total} matching runs</p>
         <nav aria-label="Recorded runs">
           {runs.map((r) => (
@@ -226,10 +317,44 @@ function App() {
             setApiKey(credential.trim());
             setAuthenticated(Boolean(credential.trim()));
             setCredential("");
+            setEmbeddingProfile("");
+            setAuthRevision((value) => value + 1);
             void refresh();
           }}
         >
-          <label htmlFor="api-key">API key (tab memory only)</label>
+          {login && (
+            <button
+              type="button"
+              onClick={() => {
+                void beginLogin(login)
+                  .then((url) => window.location.assign(url))
+                  .catch((error) => setError(String(error)));
+              }}
+            >
+              Sign in with SSO
+            </button>
+          )}
+          {ssoSession && (
+            <button
+              type="button"
+              onClick={() => {
+                void logout()
+                  .then(() => {
+                    setSsoSession(false);
+                    setApiKey("");
+                    setAuthenticated(false);
+                    setAuthRevision((value) => value + 1);
+                    void refresh();
+                  })
+                  .catch((error) => setError(String(error)));
+              }}
+            >
+              Sign out of SSO
+            </button>
+          )}
+          <label htmlFor="api-key">
+            API key or access token (tab memory only)
+          </label>
           <input
             id="api-key"
             type="password"
@@ -401,14 +526,59 @@ function App() {
                   />
                   Semantic comparison
                 </label>
+                {semantic && generationModels.some((m) => m.grading) && (
+                  <>
+                    <select
+                      aria-label="Semantic grader"
+                      value={grader}
+                      onChange={(e) => {
+                        setGrader(e.target.value);
+                        setAllowGrading(false);
+                      }}
+                    >
+                      <option value="">Offline heuristic</option>
+                      {generationModels
+                        .filter((m) => m.grading)
+                        .map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.label} · domain rubric
+                          </option>
+                        ))}
+                    </select>
+                    {grader && (
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={allowGrading}
+                          onChange={(e) => setAllowGrading(e.target.checked)}
+                        />
+                        Authorize model grading calls
+                      </label>
+                    )}
+                  </>
+                )}
                 <button
-                  disabled={busy || !compareId}
+                  disabled={
+                    busy ||
+                    !compareId ||
+                    (semantic && !!grader && !allowGrading)
+                  }
                   onClick={() => void action("diff")}
                 >
                   Diff
                 </button>
               </div>
             </section>
+            <RerunControls
+              key={`${run.id}:${selected?.id}:${authRevision}`}
+              run={run}
+              selected={selected}
+              models={generationModels}
+              onBranch={(branch) => {
+                setRuns((previous) => [branch, ...previous]);
+                choose(branch);
+              }}
+            />
             {summary && candidate && (
               <section className="comparison" aria-label="Metric comparison">
                 <div className="panel-heading">
@@ -534,9 +704,9 @@ function App() {
                       {semanticResult.changed} changed events
                     </p>
                     <p className="muted">
-                      The offline grader compares normalized words, numbers and
-                      negation. Review meaning and factual accuracy when they
-                      matter.
+                      The default offline grader compares normalized words,
+                      numbers and negation. Review meaning and factual accuracy
+                      when they matter.
                     </p>
                     {semanticResult.differences.length > 0 && (
                       <table>
@@ -590,6 +760,7 @@ function App() {
             </p>
           </>
         )}
+        <TelemetryPanel key={authRevision} authRevision={authRevision} />
       </main>
     </div>
   );

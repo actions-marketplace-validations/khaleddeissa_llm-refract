@@ -49,6 +49,22 @@ const metricKeys = new Set([
   "cache_read_tokens",
   "cache_write_tokens",
   "total_tokens",
+  "max_tokens",
+  "max_completion_tokens",
+  "max_output_tokens",
+  "maxTokens",
+  "maxOutputTokens",
+  "inputTokens",
+  "outputTokens",
+  "totalTokens",
+  "prompt_token_count",
+  "candidates_token_count",
+  "thoughts_token_count",
+  "cached_content_token_count",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+  "cacheReadInputTokens",
+  "cacheWriteInputTokens",
   "prompt_tokens",
   "completion_tokens",
 ]);
@@ -120,6 +136,25 @@ export function startSpan(input: EventInput) {
   const captured = state.execution.events.find((item) => item.id === id)!;
   return {
     id,
+    isCurrentGeneration(): boolean {
+      return (
+        context.getStore()?.execution === state.execution &&
+        state.active &&
+        captured.status === "running"
+      );
+    },
+    setParent(parentId: string): void {
+      if (captured.status !== "running") return;
+      const parentIndex = state.execution.events.findIndex(
+        (item) => item.id === parentId,
+      );
+      if (
+        parentIndex < 0 ||
+        parentIndex >= state.execution.events.indexOf(captured)
+      )
+        throw new Error("parent must precede child");
+      captured.parent_id = parentId;
+    },
     within<T>(fn: () => T): T {
       return context.run({ ...state, parentId: id }, fn);
     },
@@ -301,7 +336,11 @@ export {
   instrumentGemini,
   instrumentVertex,
   instrumentBedrock,
+  instrumentBedrockNative,
+  instrumentRealtime,
+  instrumentLibrary,
   instrumentCustom,
+  instrumentLangChainModel,
   type InstrumentOptions,
   type CustomInstrumentOptions,
   type NormalizedGeneration,
@@ -310,3 +349,14 @@ export {
 export { BatchExporter, type BatchExporterOptions } from "./exporter.js";
 export { toOtlp, fromOtlp, exportOtlp } from "./otel.js";
 export { toLangfuse, exportLangfuse } from "./langfuse.js";
+export { langchainHandler } from "./langchain.js";
+export {
+  RefractClient,
+  type EmbeddingModel,
+  type EmbeddingSelection,
+  type EmbeddingSettings,
+  type TextSearchResult,
+  type VectorMatch,
+} from "./client.js";
+export { verifyDelivery, WebhookInbox, openWebhookInbox } from "./delivery.js";
+export type { DeliveryMessage } from "./delivery.js";

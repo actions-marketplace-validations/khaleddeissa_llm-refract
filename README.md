@@ -42,18 +42,18 @@ Python / TypeScript / native JSON
 
 ## One engine, many interfaces
 
-| Interface            | What you can do                                                                                     | Guide                                  |
-| -------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------- |
-| Python SDK           | Instrument OpenAI/Anthropic/LangChain, capture usage, batch delivery and run explicit continuations | [Python](docs/usage/python.md)         |
-| npm / TypeScript SDK | Wrap providers, isolate concurrent runs, record streams and deliver through a durable exporter      | [TypeScript](docs/usage/typescript.md) |
-| Rust crates          | Embed validation, metrics, artifacts, executors, semantic graders and evaluation                    | [Rust](docs/usage/rust.md)             |
-| CLI                  | Inspect, replay, rerun, compare semantics/budgets, evaluate datasets and serve                      | [CLI](docs/usage/cli.md)               |
-| REST API             | Batch ingestion, scoped search, metrics, semantic comparison and evaluation                         | [API](docs/api.md)                     |
-| Docker image + UI    | Explore execution graphs, usage, bottlenecks and comparison in the browser                          | [Docker](docs/usage/docker.md)         |
-| MCP                  | Give agents thirteen read tools, including metrics/evaluation/search, and two optional writes       | [MCP](docs/usage/mcp.md)               |
-| Skills               | Teach agents supported inspection, debugging, artifact and regression workflows                     | [Skills](docs/usage/skills.md)         |
-| GitHub Action        | Compare fresh application output against a reviewed execution baseline                              | [CI](docs/usage/ci.md)                 |
-| `.rfr` format        | Carry readable, versioned, checksummed execution data between these interfaces                      | [File format](docs/usage/artifacts.md) |
+| Interface            | What you can do                                                                                | Guide                                  |
+| -------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------- |
+| Python SDK           | Instrument providers/local models, capture usage, durable delivery and LangGraph continuations | [Python](docs/usage/python.md)         |
+| npm / TypeScript SDK | Wrap providers, isolate concurrent runs, record streams and deliver through a durable exporter | [TypeScript](docs/usage/typescript.md) |
+| Rust crates          | Embed validation, metrics, artifacts, executors, semantic graders and evaluation               | [Rust](docs/usage/rust.md)             |
+| CLI                  | Inspect, replay, rerun, compare semantics/budgets, evaluate datasets and serve                 | [CLI](docs/usage/cli.md)               |
+| REST API             | Batch/OTLP ingestion, vector search, metrics, comparison and tenant administration             | [API](docs/api.md)                     |
+| Docker image + UI    | Explore execution graphs, usage, bottlenecks and comparison in the browser                     | [Docker](docs/usage/docker.md)         |
+| MCP                  | Give agents sixteen read tools, including metrics/evaluation/search, and two optional writes   | [MCP](docs/usage/mcp.md)               |
+| Skills               | Teach agents supported inspection, debugging, artifact and regression workflows                | [Skills](docs/usage/skills.md)         |
+| GitHub Action        | Compare fresh application output against a reviewed execution baseline                         | [CI](docs/usage/ci.md)                 |
+| `.rfr` format        | Carry readable, versioned, checksummed execution data between these interfaces                 | [File format](docs/usage/artifacts.md) |
 
 The Rust engine owns validation, persistence, replay policies and comparison. SDKs capture data;
 MCP and the UI call the same API. Skills provide operating instructions; they are not separate engines.
@@ -62,20 +62,20 @@ MCP and the UI call the same API. Skills provide operating instructions; they ar
 
 - **Automatic capture:** opt-in OpenAI, Anthropic, Azure, Gemini, Vertex, Bedrock and custom adapters record inputs, outputs, usage, streaming
   latency and errors; Python also integrates LangChain callbacks; OpenTelemetry export connects both SDKs to Langfuse and other trace backends.
-- **Optimization:** compare measured token usage, latency and explicitly priced cost. Missing prices
+- **Optimization:** compare measured token usage, latency and explicitly priced cost; refresh approved price feeds and reconcile mapped invoice rows. Missing prices
   stay unknown. Find expensive calls and slow steps directly in the execution graph.
-- **Executable branches:** supply trusted application executors to rerun a suffix with another model
-  or implementation. Prefix evidence and lineage stay attached to the new recording.
+- **Executable branches:** choose a configured model in the Inspector, API or SDK, or supply application executors to rerun a suffix
+  or implementation, or continue an application-owned LangGraph checkpoint. Prefix evidence and lineage stay attached to the new recording.
 - **Regression datasets:** grade outputs with the offline heuristic or a custom model grader and apply
   cost/token/latency budgets across named cases. Integrate results into CI or MCP investigations.
 - **Service operation:** batch exporters fail open, retry and optionally spool to disk. The service
-  supports scoped API keys, roles, audit logs, retention, rate limiting and SQLite/PostgreSQL storage.
+  supports scoped managed keys, persistent browser SSO/OIDC, SCIM user/group provisioning, audit lifecycle, encryption rotation, shared quotas and optional PostgreSQL row security.
 
+[OTLP traces, logs and metrics](docs/usage/otel.md) · [SSO and service controls](docs/usage/service-controls.md) · [Pricing](docs/usage/pricing.md) ·
 [Provider coverage](docs/usage/providers.md) · [Instrumentation](docs/usage/python.md) · [Metrics](docs/usage/metrics.md) ·
 [Rerun](docs/usage/rerun.md) · [Evaluation](docs/usage/evaluation.md) · [Operation](docs/production.md)
 
-The current development release is **0.1.4 (unreleased)**. See the [changelog](CHANGELOG.md) for
-features, compatibility changes and security fixes. Registry releases may lag this checkout.
+This checkout targets **0.1.4**. Published package versions may lag this checkout.
 
 ## Record in your application
 
@@ -158,7 +158,7 @@ them; [conversion instructions](docs/usage/artifacts.md) explain how to create a
 Checked-in samples live in [examples/artifacts](examples/artifacts); generated examples go in `.examples/`.
 
 Recorded replay returns captured outputs and never invokes external tools/models. Forking preserves
-a prefix and lineage. Executable `rerun` uses explicitly supplied handlers; it cannot restore arbitrary
+a prefix and lineage. Model reruns use configured provider profiles; application tool reruns use explicitly supplied handlers; it cannot restore arbitrary
 process memory from an artifact. `diff --semantic` adds pluggable output grading and metric budgets.
 Regression checks need a **fresh** execution from the code under test.
 
@@ -176,5 +176,4 @@ bundled browser workspace. See the [inspector walkthrough](docs/usage/inspector.
 - [Repository structure and the purpose of each directory](docs/repository.md)
 - [Local development, tests and package builds](docs/development.md)
 - [Database migrations](docs/migrations.md)
-- [Current capabilities and remaining roadmap](docs/roadmap.md)
 - [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Apache-2.0 license](LICENSE)
